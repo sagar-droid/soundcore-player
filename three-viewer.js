@@ -6,7 +6,7 @@
  *   - screen_glass: Retina OLED display glass cover with IOR 1.45 transmission
  *   - click_wheel: Tactile micro-beveled circular click wheel ring
  *   - wheel_center: Center tactile mechanical select button
- *   - jack_rings: Gold-plated dual headphone output ports & internal chamber
+ *   - jack_rings: (misnamed in the GLB) roughly half of the unibody shell, shares the chassis finish
  *   - earbuds: Left and Right in-ear acoustic monitor pieces
  *   - audio_jack: 3.5mm gold-plated jack plug
  *   - wire: Physical flexible audio cable
@@ -32,6 +32,9 @@ const FINISH_COLORS = {
   pink:      { hex: 0xe49ca8, name: 'Blush Pink' }
 };
 
+// Renderers output sRGB, so hex swatch values must be converted to linear space
+const srgb = (hex) => new THREE.Color(hex).convertSRGBToLinear();
+
 class Soundcore3DViewer {
   constructor() {
     this.heroContainer = document.getElementById('hero-3d-container');
@@ -40,6 +43,7 @@ class Soundcore3DViewer {
     this.currentViewMode = 'all'; // 'all' | 'player' | 'earphones'
     this.explodeFactor = 0;
     this.targetExplodeFactor = 0;
+    this.targetCameraDistance = null;
 
     // Interaction impulse for fluid wire ripple
     this.wireImpulse = 0;
@@ -66,7 +70,10 @@ class Soundcore3DViewer {
     this.activeDraggedPart = null;
     this.hoveredPart = null;
     this.dragPlane = new THREE.Plane();
-    this.dragPlaneOffset = new THREE.Vector3();
+    this.dragFrame = null;
+    this.dragTarget = null;
+    this.dragStartLocal = new THREE.Vector3();
+    this.dragStartValue = new THREE.Vector3();
 
     // Physics state for Earbuds & Jack
     this.earbudsPhysPos = new THREE.Vector3();
@@ -76,11 +83,13 @@ class Soundcore3DViewer {
     this.playerPhysOffset = new THREE.Vector3();
     this.playerPhysOffsetVel = new THREE.Vector3();
 
-    // Cable Verlet Physics Nodes (chain connecting Jack -> Cable -> Earbuds)
-    this.numCableNodes = 16;
-    this.cableNodes = [];
-    this.cableRestLengths = [];
-    this.cableGrabNodeIndex = -1;
+    // Cable skinning: per-vertex weights to the earbud/jack joints + a draggable grab point
+    this.cableEarbudsWeights = null;
+    this.cableJackWeights = null;
+    this.cableGrabCenter = new THREE.Vector3();
+    this.cableGrabOffset = new THREE.Vector3();
+    this.cableGrabVel = new THREE.Vector3();
+    this.wireAtRest = false;
 
     // Hotspot elements tracking
     this.hotspotElements = {};
@@ -101,12 +110,10 @@ class Soundcore3DViewer {
       this.initHeroScene();
       this.initStudioScene();
 
-      // Create & apply Apple-style Photorealistic Studio Softbox Environment Map
-      this.studioEnvMap = this.createStudioEnvironment(this.heroRenderer);
-      if (this.studioEnvMap) {
-        if (this.heroScene) this.heroScene.environment = this.studioEnvMap;
-        if (this.studioScene) this.studioScene.environment = this.studioEnvMap;
-      }
+      // Create & apply Apple-style Photorealistic Studio Softbox Environment Map.
+      // PMREM output is a render target bound to one WebGL context, so each renderer needs its own.
+      if (this.heroScene) this.heroScene.environment = this.createStudioEnvironment(this.heroRenderer);
+      if (this.studioScene) this.studioScene.environment = this.createStudioEnvironment(this.studioRenderer);
 
       this.loadModel('./mp3_player.glb?v=20261104_05');
     } else {
@@ -167,12 +174,17 @@ class Soundcore3DViewer {
       ctx.fillStyle = topSoftbox;
       ctx.fillRect(320, 0, 384, 110);
 
-      // Gallery Pedestal Ground Bounce (Simulates pure white acrylic reflection)
-      const groundBounce = ctx.createLinearGradient(0, 410, 0, 512);
-      groundBounce.addColorStop(0, 'rgba(245, 245, 247, 0.0)');
-      groundBounce.addColorStop(1, 'rgba(255, 255, 255, 0.6)');
-      ctx.fillStyle = groundBounce;
-      ctx.fillRect(0, 410, 1024, 102);
+      // Dark studio floor & horizon flags (give metal surfaces contrast instead of a flat white wash)
+      const floor = ctx.createLinearGradient(0, 270, 0, 512);
+      floor.addColorStop(0, 'rgba(40, 42, 48, 0.0)');
+      floor.addColorStop(0.3, 'rgba(40, 42, 48, 0.75)');
+      floor.addColorStop(1, 'rgba(22, 23, 26, 0.95)');
+      ctx.fillStyle = floor;
+      ctx.fillRect(0, 270, 1024, 242);
+
+      ctx.fillStyle = 'rgba(30, 32, 36, 0.55)';
+      ctx.fillRect(560, 60, 70, 260);
+      ctx.fillRect(0, 80, 60, 240);
 
       const tex = new THREE.CanvasTexture(canvas);
       tex.mapping = THREE.EquirectangularReflectionMapping;
@@ -184,6 +196,45 @@ class Soundcore3DViewer {
       console.warn('Studio environment map generation fallback:', e);
       return null;
     }
+  }
+
+  /* ==========================================================================
+     SHARED RENDERER & LIGHT RIG (Hero and Studio must render finishes identically)
+     ========================================================================== */
+  createRenderer(width, height) {
+    const renderer = new THREE.WebGLRenderer({
+      antialias: true,
+      alpha: true,
+      logarithmicDepthBuffer: true
+    });
+    renderer.setSize(width, height);
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.outputEncoding = THREE.sRGBEncoding;
+    renderer.toneMapping = THREE.ACESFilmicToneMapping;
+    renderer.toneMappingExposure = 0.95;
+    return renderer;
+  }
+
+  addStudioLights(scene) {
+    // Low ambient keeps form shading; key/rim do the sculpting
+    scene.add(new THREE.AmbientLight(0xffffff, 0.25));
+
+    const key = new THREE.DirectionalLight(0xfffbf2, 1.7);
+    key.position.set(4, 7, 6);
+    scene.add(key);
+
+    const fill = new THREE.DirectionalLight(0xd9e5ff, 0.6);
+    fill.position.set(-6, -2, 5);
+    scene.add(fill);
+
+    const rim = new THREE.DirectionalLight(0xffffff, 1.3);
+    rim.position.set(0, 6, -6);
+    scene.add(rim);
+
+    // Soft gallery pedestal bounce
+    const underBounce = new THREE.DirectionalLight(0xffeedd, 0.25);
+    underBounce.position.set(0, -4, 2);
+    scene.add(underBounce);
   }
 
   cacheHotspotElements() {
@@ -205,43 +256,16 @@ class Soundcore3DViewer {
     const width = this.heroContainer.clientWidth || 800;
     const height = this.heroContainer.clientHeight || 500;
 
+    // No fog: it washed the hero finish out relative to the Studio vitrine
     this.heroScene = new THREE.Scene();
-    this.heroScene.fog = new THREE.FogExp2(0xf5f5f7, 0.04);
 
     this.heroCamera = new THREE.PerspectiveCamera(34, width / height, 0.1, 100);
     this.heroCamera.position.set(0, 0.12, 6.8);
 
-    this.heroRenderer = new THREE.WebGLRenderer({
-      antialias: true,
-      alpha: true,
-      logarithmicDepthBuffer: true
-    });
-    this.heroRenderer.setSize(width, height);
-    this.heroRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.heroRenderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.heroRenderer.toneMappingExposure = 1.15;
-
+    this.heroRenderer = this.createRenderer(width, height);
     this.heroContainer.appendChild(this.heroRenderer.domElement);
 
-    const amb = new THREE.AmbientLight(0xffffff, 1.25);
-    this.heroScene.add(amb);
-
-    const key = new THREE.DirectionalLight(0xfffbf2, 1.35);
-    key.position.set(4, 7, 6);
-    this.heroScene.add(key);
-
-    const fill = new THREE.DirectionalLight(0xd9e5ff, 0.75);
-    fill.position.set(-6, -2, 5);
-    this.heroScene.add(fill);
-
-    const rim = new THREE.DirectionalLight(0xffffff, 0.95);
-    rim.position.set(0, 6, -6);
-    this.heroScene.add(rim);
-
-    // Soft gallery pedestal bounce
-    const underBounce = new THREE.DirectionalLight(0xffeedd, 0.35);
-    underBounce.position.set(0, -4, 2);
-    this.heroScene.add(underBounce);
+    this.addStudioLights(this.heroScene);
 
     this.setupHeroInteraction();
 
@@ -316,47 +340,24 @@ class Soundcore3DViewer {
     this.studioScene = new THREE.Scene();
 
     this.studioCamera = new THREE.PerspectiveCamera(34, width / height, 0.1, 100);
-    this.studioCamera.position.set(0, 0.22, 6.2);
+    this.defaultStudioDistance = 6.2;
+    this.studioCamera.position.set(0, 0.22, this.defaultStudioDistance);
 
-    this.studioRenderer = new THREE.WebGLRenderer({
-      antialias: true,
-      alpha: true,
-      logarithmicDepthBuffer: true
-    });
-    this.studioRenderer.setSize(width, height);
-    this.studioRenderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
-    this.studioRenderer.toneMapping = THREE.ACESFilmicToneMapping;
-    this.studioRenderer.toneMappingExposure = 1.15;
-
+    this.studioRenderer = this.createRenderer(width, height);
     this.studioContainer.appendChild(this.studioRenderer.domElement);
 
-    const amb = new THREE.AmbientLight(0xffffff, 1.25);
-    this.studioScene.add(amb);
-
-    const dir1 = new THREE.DirectionalLight(0xfffbf2, 1.35);
-    dir1.position.set(4, 7, 6);
-    this.studioScene.add(dir1);
-
-    const dir2 = new THREE.DirectionalLight(0xd9e5ff, 0.75);
-    dir2.position.set(-5, -2, 4);
-    this.studioScene.add(dir2);
-
-    const rim = new THREE.DirectionalLight(0xffffff, 0.95);
-    rim.position.set(0, 5, -5);
-    this.studioScene.add(rim);
-
-    // Subtle bottom bounce
-    const underBounce = new THREE.DirectionalLight(0xffeedd, 0.35);
-    underBounce.position.set(0, -4, 2);
-    this.studioScene.add(underBounce);
+    this.addStudioLights(this.studioScene);
 
     if (typeof THREE.OrbitControls !== 'undefined') {
       this.studioControls = new THREE.OrbitControls(this.studioCamera, this.studioRenderer.domElement);
       this.studioControls.enableDamping = true;
       this.studioControls.dampingFactor = 0.05;
-      this.studioControls.maxDistance = 11;
-      this.studioControls.minDistance = 4.0;
+      // The full cable run is ~8 world units long, so allow pulling back far enough to see it all
+      this.studioControls.maxDistance = 22;
+      this.studioControls.minDistance = 3.0;
       this.studioControls.enablePan = false;
+      // Manual zoom/orbit cancels any automatic camera framing in progress
+      this.studioControls.addEventListener('start', () => { this.targetCameraDistance = null; });
     }
 
     this.setupStudioInteractiveDrag();
@@ -373,27 +374,25 @@ class Soundcore3DViewer {
       if (this.studioParts) {
         const p = this.studioParts;
 
-        // Explode separation offsets (Generous architectural float)
+        // Explode separation offsets, sized to the ~0.09-unit player body so layers stay readable.
+        // jack_rings is half of the body shell, so it travels with the chassis instead of flying off.
         if (p.screenGlass && p.screenGlass.userData.basePos) {
-          p.screenGlass.position.y = p.screenGlass.userData.basePos.y + f * 0.16;
-          p.screenGlass.position.z = p.screenGlass.userData.basePos.z - f * 0.015;
+          p.screenGlass.position.y = p.screenGlass.userData.basePos.y + f * 0.04;
         }
 
         if (p.clickWheel && p.clickWheel.userData.basePos) {
-          p.clickWheel.position.y = p.clickWheel.userData.basePos.y + f * 0.095;
+          p.clickWheel.position.y = p.clickWheel.userData.basePos.y + f * 0.022;
         }
 
         if (p.wheelCenter && p.wheelCenter.userData.basePos) {
-          p.wheelCenter.position.y = p.wheelCenter.userData.basePos.y + f * 0.135;
+          p.wheelCenter.position.y = p.wheelCenter.userData.basePos.y + f * 0.032;
         }
 
-        if (p.jackRings && p.jackRings.userData.basePos) {
-          p.jackRings.position.z = p.jackRings.userData.basePos.z - f * 0.11;
-        }
-
-        if (p.chassis && p.chassis.userData.basePos) {
-          p.chassis.position.y = p.chassis.userData.basePos.y - f * 0.045;
-        }
+        [p.chassis, p.jackRings].forEach(part => {
+          if (part && part.userData.basePos) {
+            part.position.y = part.userData.basePos.y - f * 0.012;
+          }
+        });
 
         // Apply interactive physics to earbuds, jack, and wire
         this.updateInteractivePartPhysics(time, f);
@@ -401,6 +400,17 @@ class Soundcore3DViewer {
 
       // Viscous decay on wave impulse
       this.wireImpulse *= 0.93;
+      if (this.wireImpulse < 0.001) this.wireImpulse = 0;
+
+      // Smooth automatic dolly (e.g. pulling back to frame the exploded view)
+      if (this.targetCameraDistance != null) {
+        const target = this.studioControls ? this.studioControls.target : new THREE.Vector3();
+        const offset = this.studioCamera.position.clone().sub(target);
+        const dist = offset.length();
+        const next = dist + (this.targetCameraDistance - dist) * 0.08;
+        this.studioCamera.position.copy(target).add(offset.setLength(next));
+        if (Math.abs(this.targetCameraDistance - next) < 0.01) this.targetCameraDistance = null;
+      }
 
       if (this.studioControls && this.studioControls.enabled) {
         this.studioControls.update();
@@ -426,6 +436,7 @@ class Soundcore3DViewer {
       if (p.audioJack && p.audioJack.visible) parts.push(p.audioJack);
       if (p.wire && p.wire.visible) parts.push(p.wire);
       if (p.chassis && p.chassis.visible) parts.push(p.chassis);
+      if (p.jackRings && p.jackRings.visible) parts.push(p.jackRings);
       if (p.screenGlass && p.screenGlass.visible) parts.push(p.screenGlass);
       if (p.clickWheel && p.clickWheel.visible) parts.push(p.clickWheel);
       return parts;
@@ -441,36 +452,14 @@ class Soundcore3DViewer {
       updateMouseCoords(e);
 
       if (this.isDraggingPart && this.activeDraggedPart) {
-        // Dragging an interactive 3D part
+        // Dragging an interactive 3D part: move it by the pointer's delta since grab,
+        // measured in a frame that the drag itself does not move (avoids feedback jitter)
         this.raycaster.setFromCamera(this.mouse, this.studioCamera);
         const intersect = new THREE.Vector3();
         if (this.raycaster.ray.intersectPlane(this.dragPlane, intersect)) {
-          intersect.sub(this.dragPlaneOffset);
-
-          // Convert to local coordinates within studioInnerModel
-          if (this.studioInnerModel) {
-            const localTarget = this.studioInnerModel.worldToLocal(intersect);
-
-            if (this.activeDraggedPart === this.studioParts.earbuds) {
-              this.earbudsPhysPos.copy(localTarget);
-              this.wireImpulse = Math.min(this.wireImpulse + 0.35, 4.5);
-            } else if (this.activeDraggedPart === this.studioParts.audioJack) {
-              this.jackPhysPos.copy(localTarget);
-              this.wireImpulse = Math.min(this.wireImpulse + 0.35, 4.5);
-            } else if (this.activeDraggedPart === this.studioParts.wire) {
-              if (this.cableGrabNodeIndex >= 0 && this.cableGrabNodeIndex < this.cableNodes.length) {
-                this.cableNodes[this.cableGrabNodeIndex].x = localTarget.x;
-                this.cableNodes[this.cableGrabNodeIndex].y = localTarget.y;
-                this.cableNodes[this.cableGrabNodeIndex].z = localTarget.z;
-              }
-              this.wireImpulse = Math.min(this.wireImpulse + 0.30, 4.0);
-            } else {
-              // Dragging the player unibody (chassis / wheel / screen)
-              const base = this.studioParts.chassis.userData.basePos;
-              this.playerPhysOffset.copy(localTarget).sub(base);
-              this.wireImpulse = Math.min(this.wireImpulse + 0.25, 4.0);
-            }
-          }
+          const delta = this.dragFrame.worldToLocal(intersect).sub(this.dragStartLocal);
+          this.dragTarget.copy(this.dragStartValue).add(delta);
+          this.wireImpulse = Math.min(this.wireImpulse + 0.3, 4.0);
         }
       } else {
         // Hover raycasting
@@ -496,12 +485,14 @@ class Soundcore3DViewer {
 
       if (intersects.length > 0) {
         const hit = intersects[0];
+        const p = this.studioParts;
         this.isDraggingPart = true;
         this.activeDraggedPart = hit.object;
 
         if (this.studioControls) {
           this.studioControls.enabled = false;
         }
+        this.targetCameraDistance = null;
 
         dom.style.cursor = 'grabbing';
 
@@ -509,24 +500,24 @@ class Soundcore3DViewer {
         const planeNormal = this.studioCamera.getWorldDirection(new THREE.Vector3()).negate();
         this.dragPlane.setFromNormalAndCoplanarPoint(planeNormal, hit.point);
 
-        const objWorldPos = hit.object.getWorldPosition(new THREE.Vector3());
-        this.dragPlaneOffset.copy(hit.point).sub(objWorldPos);
-
-        // If wire clicked, grab the closest node
-        if (this.activeDraggedPart === this.studioParts.wire && this.studioInnerModel) {
-          const localHit = this.studioInnerModel.worldToLocal(hit.point.clone());
-          let closestIdx = 8;
-          let closestDist = Infinity;
-          for (let i = 0; i < this.cableNodes.length; i++) {
-            const n = this.cableNodes[i];
-            const d = Math.hypot(n.x - localHit.x, n.y - localHit.y, n.z - localHit.z);
-            if (d < closestDist) {
-              closestDist = d;
-              closestIdx = i;
-            }
-          }
-          this.cableGrabNodeIndex = closestIdx;
+        // Pick which physics value this drag drives, and the (stationary) frame to measure in
+        if (hit.object === p.earbuds) {
+          this.dragFrame = p.earbuds.parent;
+          this.dragTarget = this.earbudsPhysPos;
+        } else if (hit.object === p.audioJack) {
+          this.dragFrame = p.audioJack.parent;
+          this.dragTarget = this.jackPhysPos;
+        } else if (hit.object === p.wire) {
+          this.dragFrame = p.wire.parent;
+          this.dragTarget = this.cableGrabOffset;
+          this.cableGrabCenter.copy(p.wire.parent.worldToLocal(hit.point.clone())).sub(this.cableGrabOffset);
+        } else {
+          // Player unibody moves the whole inner model, so measure in the fixed pivot frame
+          this.dragFrame = this.studioModelRoot;
+          this.dragTarget = this.playerPhysOffset;
         }
+        this.dragStartLocal.copy(this.dragFrame.worldToLocal(hit.point.clone()));
+        this.dragStartValue.copy(this.dragTarget);
       }
     });
 
@@ -534,7 +525,6 @@ class Soundcore3DViewer {
       if (this.isDraggingPart) {
         this.isDraggingPart = false;
         this.activeDraggedPart = null;
-        this.cableGrabNodeIndex = -1;
 
         if (this.studioControls) {
           this.studioControls.enabled = true;
@@ -546,103 +536,113 @@ class Soundcore3DViewer {
   }
 
   /* ==========================================================================
-     PHYSICS SIMULATION & WIRE CABLE VERLET CHAIN
+     CABLE SKINNING & SPRING PHYSICS
+     Wire vertices are weighted by distance to the earbud and jack joints, so the cable
+     follows those parts exactly where it meets them and can never tear apart.
      ========================================================================== */
   initCablePhysics(parts) {
-    if (!parts || !parts.earbuds || !parts.audioJack) return;
+    if (!parts || !parts.earbuds || !parts.audioJack || !parts.wire) return;
 
-    this.cableNodes = [];
-    this.cableRestLengths = [];
+    const orig = parts.wire.geometry.userData.origPositions;
+    const wireIndex = parts.wire.geometry.index.array;
+    const wireVerts = Array.from(new Set(wireIndex));
 
-    const start = parts.audioJack.userData.basePos || parts.audioJack.position;
-    const end = parts.earbuds.userData.basePos || parts.earbuds.position;
+    // Junctions: earbud / jack vertices that sit on the wire (all three share one vertex space)
+    const findJunctions = (mesh, tolerance) => {
+      const cell = tolerance;
+      const grid = new Map();
+      const key = (x, y, z) => `${Math.floor(x / cell)},${Math.floor(y / cell)},${Math.floor(z / cell)}`;
+      for (const i of wireVerts) {
+        const k = key(orig[i * 3], orig[i * 3 + 1], orig[i * 3 + 2]);
+        if (!grid.has(k)) grid.set(k, []);
+        grid.get(k).push(i);
+      }
+      const junctions = [];
+      for (const i of new Set(mesh.geometry.index.array)) {
+        const x = orig[i * 3], y = orig[i * 3 + 1], z = orig[i * 3 + 2];
+        const cx = Math.floor(x / cell), cy = Math.floor(y / cell), cz = Math.floor(z / cell);
+        let near = false;
+        for (let dx = -1; dx <= 1 && !near; dx++) {
+          for (let dy = -1; dy <= 1 && !near; dy++) {
+            for (let dz = -1; dz <= 1 && !near; dz++) {
+              const bucket = grid.get(`${cx + dx},${cy + dy},${cz + dz}`);
+              if (bucket && bucket.some(j => Math.hypot(orig[j * 3] - x, orig[j * 3 + 1] - y, orig[j * 3 + 2] - z) < tolerance)) {
+                near = true;
+              }
+            }
+          }
+        }
+        if (near) junctions.push([x, y, z]);
+      }
+      return junctions;
+    };
 
-    for (let i = 0; i < this.numCableNodes; i++) {
-      const alpha = i / (this.numCableNodes - 1);
-      // Natural sagging catenary curve
-      const sag = Math.sin(alpha * Math.PI) * 0.05;
-      const x = THREE.MathUtils.lerp(start.x, end.x, alpha);
-      const y = THREE.MathUtils.lerp(start.y, end.y, alpha) - sag;
-      const z = THREE.MathUtils.lerp(start.z, end.z, alpha) + sag * 0.5;
+    const weightsFor = (junctions, radius) => {
+      const w = new Float32Array(orig.length / 3);
+      if (junctions.length === 0) return w;
+      for (const i of wireVerts) {
+        const x = orig[i * 3], y = orig[i * 3 + 1], z = orig[i * 3 + 2];
+        let d = Infinity;
+        for (const j of junctions) d = Math.min(d, Math.hypot(j[0] - x, j[1] - y, j[2] - z));
+        const t = THREE.MathUtils.clamp(1 - d / radius, 0, 1);
+        w[i] = t * t * (3 - 2 * t); // smoothstep falloff
+      }
+      return w;
+    };
 
-      this.cableNodes.push({
-        x, y, z,
-        oldX: x, oldY: y, oldZ: z,
-        restX: x, restY: y, restZ: z
-      });
-    }
-
-    for (let i = 0; i < this.numCableNodes - 1; i++) {
-      const a = this.cableNodes[i];
-      const b = this.cableNodes[i + 1];
-      this.cableRestLengths.push(Math.hypot(b.x - a.x, b.y - a.y, b.z - a.z));
-    }
+    this.cableEarbudsWeights = weightsFor(findJunctions(parts.earbuds, 0.002), 0.1);
+    this.cableJackWeights = weightsFor(findJunctions(parts.audioJack, 0.002), 0.06);
 
     this.earbudsPhysPos.copy(parts.earbuds.userData.basePos);
     this.jackPhysPos.copy(parts.audioJack.userData.basePos);
+    this.earbudsPhysVel.set(0, 0, 0);
+    this.jackPhysVel.set(0, 0, 0);
     this.playerPhysOffset.set(0, 0, 0);
+    this.playerPhysOffsetVel.set(0, 0, 0);
+    this.cableGrabOffset.set(0, 0, 0);
+    this.cableGrabVel.set(0, 0, 0);
+    this.wireAtRest = false;
+  }
+
+  // Critically-damped-ish spring toward target (skipped while that value is being dragged)
+  springTo(pos, vel, target, stiffness, damping) {
+    vel.x = (vel.x + (target.x - pos.x) * stiffness) * damping;
+    vel.y = (vel.y + (target.y - pos.y) * stiffness) * damping;
+    vel.z = (vel.z + (target.z - pos.z) * stiffness) * damping;
+    pos.add(vel);
+    if (vel.lengthSq() < 1e-14 && pos.distanceToSquared(target) < 1e-12) {
+      pos.copy(target);
+      vel.set(0, 0, 0);
+    }
   }
 
   updateInteractivePartPhysics(time, explodeFactor) {
     const p = this.studioParts;
-    const last = this.cableNodes.length - 1;
+    const dragged = this.isDraggingPart ? this.dragTarget : null;
 
-    // 1. Spring-mass return for Earbuds
+    // 1. Earbuds
     const earbudsTarget = p.earbuds.userData.basePos.clone();
-    if (explodeFactor > 0.01) {
-      earbudsTarget.x -= explodeFactor * 0.28;
-      earbudsTarget.y += explodeFactor * 0.20;
-      earbudsTarget.z += explodeFactor * 0.14;
-    }
-
-    if (!this.isDraggingPart || this.activeDraggedPart !== p.earbuds) {
-      const fx = (earbudsTarget.x - this.earbudsPhysPos.x) * 0.14;
-      const fy = (earbudsTarget.y - this.earbudsPhysPos.y) * 0.14;
-      const fz = (earbudsTarget.z - this.earbudsPhysPos.z) * 0.14;
-
-      this.earbudsPhysVel.x = (this.earbudsPhysVel.x + fx) * 0.86;
-      this.earbudsPhysVel.y = (this.earbudsPhysVel.y + fy) * 0.86;
-      this.earbudsPhysVel.z = (this.earbudsPhysVel.z + fz) * 0.86;
-
-      this.earbudsPhysPos.add(this.earbudsPhysVel);
+    earbudsTarget.x -= explodeFactor * 0.06;
+    earbudsTarget.y += explodeFactor * 0.03;
+    if (dragged !== this.earbudsPhysPos) {
+      this.springTo(this.earbudsPhysPos, this.earbudsPhysVel, earbudsTarget, 0.14, 0.82);
     }
     p.earbuds.position.copy(this.earbudsPhysPos);
 
-    // 2. Spring-mass return for Audio Jack
+    // 2. Audio Jack
     const jackTarget = p.audioJack.userData.basePos.clone();
-    if (explodeFactor > 0.01) {
-      jackTarget.x += explodeFactor * 0.24;
-      jackTarget.y -= explodeFactor * 0.18;
-      jackTarget.z -= explodeFactor * 0.16;
-    }
-
-    if (!this.isDraggingPart || this.activeDraggedPart !== p.audioJack) {
-      const fx = (jackTarget.x - this.jackPhysPos.x) * 0.16;
-      const fy = (jackTarget.y - this.jackPhysPos.y) * 0.16;
-      const fz = (jackTarget.z - this.jackPhysPos.z) * 0.16;
-
-      this.jackPhysVel.x = (this.jackPhysVel.x + fx) * 0.84;
-      this.jackPhysVel.y = (this.jackPhysVel.y + fy) * 0.84;
-      this.jackPhysVel.z = (this.jackPhysVel.z + fz) * 0.84;
-
-      this.jackPhysPos.add(this.jackPhysVel);
+    jackTarget.x += explodeFactor * 0.03;
+    jackTarget.y -= explodeFactor * 0.02;
+    if (dragged !== this.jackPhysPos) {
+      this.springTo(this.jackPhysPos, this.jackPhysVel, jackTarget, 0.16, 0.8);
     }
     p.audioJack.position.copy(this.jackPhysPos);
 
-    // 3. Spring-mass return for Player unibody
-    const isDraggingPlayer = this.isDraggingPart && (
-      this.activeDraggedPart === p.chassis ||
-      this.activeDraggedPart === p.screenGlass ||
-      this.activeDraggedPart === p.clickWheel
-    );
-
-    if (!isDraggingPlayer) {
-      this.playerPhysOffsetVel.x = (this.playerPhysOffsetVel.x - this.playerPhysOffset.x * 0.15) * 0.84;
-      this.playerPhysOffsetVel.y = (this.playerPhysOffsetVel.y - this.playerPhysOffset.y * 0.15) * 0.84;
-      this.playerPhysOffsetVel.z = (this.playerPhysOffsetVel.z - this.playerPhysOffset.z * 0.15) * 0.84;
-      this.playerPhysOffset.add(this.playerPhysOffsetVel);
+    // 3. Player unibody (moves the whole inner model)
+    const zero = new THREE.Vector3();
+    if (dragged !== this.playerPhysOffset) {
+      this.springTo(this.playerPhysOffset, this.playerPhysOffsetVel, zero, 0.15, 0.8);
     }
-
     if (this.studioInnerModel) {
       this.studioInnerModel.position.set(
         -this.modelCenter.x + this.playerPhysOffset.x,
@@ -651,98 +651,63 @@ class Soundcore3DViewer {
       );
     }
 
-    // 4. Update Verlet Cable Nodes
-    if (this.cableNodes.length > 0) {
-      // Pin ends to Jack and Earbuds
-      this.cableNodes[0].x = this.jackPhysPos.x;
-      this.cableNodes[0].y = this.jackPhysPos.y;
-      this.cableNodes[0].z = this.jackPhysPos.z;
-
-      this.cableNodes[last].x = this.earbudsPhysPos.x;
-      this.cableNodes[last].y = this.earbudsPhysPos.y;
-      this.cableNodes[last].z = this.earbudsPhysPos.z;
-
-      // Verlet momentum & gravity
-      for (let i = 1; i < last; i++) {
-        if (i === this.cableGrabNodeIndex) continue;
-        const n = this.cableNodes[i];
-        const vx = (n.x - n.oldX) * 0.92;
-        const vy = (n.y - n.oldY) * 0.92;
-        const vz = (n.z - n.oldZ) * 0.92;
-
-        n.oldX = n.x;
-        n.oldY = n.y;
-        n.oldZ = n.z;
-
-        const fluidWave = Math.sin(n.x * 25 + time * 3.5 + this.wireImpulse * 2.2) * 0.0004;
-        n.x += vx;
-        n.y += vy - 0.0002 + fluidWave;
-        n.z += vz;
-      }
-
-      // Relaxation constraints (4 passes)
-      for (let iter = 0; iter < 4; iter++) {
-        for (let i = 0; i < last; i++) {
-          const a = this.cableNodes[i];
-          const b = this.cableNodes[i + 1];
-          const dx = b.x - a.x;
-          const dy = b.y - a.y;
-          const dz = b.z - a.z;
-          const dist = Math.hypot(dx, dy, dz);
-          const rest = this.cableRestLengths[i] || 0.02;
-          if (dist > 1e-6) {
-            const factor = (dist - rest) / dist * 0.5;
-            if (i > 0 && i !== this.cableGrabNodeIndex) {
-              a.x += dx * factor;
-              a.y += dy * factor;
-              a.z += dz * factor;
-            }
-            if (i + 1 < last && (i + 1) !== this.cableGrabNodeIndex) {
-              b.x -= dx * factor;
-              b.y -= dy * factor;
-              b.z -= dz * factor;
-            }
-          }
-        }
-      }
-
-      // 5. Deform physical Wire Mesh along Verlet curve + harmonic water ripples
-      if (p.wire && p.wire.geometry && p.wire.geometry.userData.origPositions) {
-        const posAttr = p.wire.geometry.attributes.position;
-        const arr = posAttr.array;
-        const orig = p.wire.geometry.userData.origPositions;
-
-        for (let i = 0; i < posAttr.count; i++) {
-          const idx = i * 3;
-          const ox = orig[idx];
-          const oy = orig[idx + 1];
-          const oz = orig[idx + 2];
-
-          // Normalize along cable X-span: earbuds (~ -0.13) to jack (~ 0.19)
-          const t = THREE.MathUtils.clamp((ox + 0.128) / (0.186 + 0.128), 0, 1);
-          const nodeT = (1 - t) * last;
-          const nIdx = Math.floor(nodeT);
-          const frac = nodeT - nIdx;
-          const n0 = this.cableNodes[Math.min(nIdx, last)];
-          const n1 = this.cableNodes[Math.min(nIdx + 1, last)];
-
-          const offX = THREE.MathUtils.lerp(n0.x - n0.restX, n1.x - n1.restX, frac);
-          const offY = THREE.MathUtils.lerp(n0.y - n0.restY, n1.y - n1.restY, frac);
-          const offZ = THREE.MathUtils.lerp(n0.z - n0.restZ, n1.z - n1.restZ, frac);
-
-          // Superimposed flowing water ripples
-          const waveY = Math.sin(ox * 28.0 + oz * 16.0 + time * 3.4 + this.wireImpulse * 2.2) * 0.0034
-                      + Math.cos(oz * 20.0 - time * 2.6) * 0.0024;
-          const waveX = Math.cos(oz * 22.0 + time * 2.8 + this.wireImpulse * 1.5) * 0.0028;
-
-          arr[idx]     = ox + offX + waveX;
-          arr[idx + 1] = oy + offY + waveY;
-          arr[idx + 2] = oz + offZ;
-        }
-
-        posAttr.needsUpdate = true;
-      }
+    // 4. Cable grab point
+    if (dragged !== this.cableGrabOffset) {
+      this.springTo(this.cableGrabOffset, this.cableGrabVel, zero, 0.12, 0.8);
     }
+
+    // 5. Skin the wire. Skip rewriting it once everything has settled (a static mesh can't shimmer)
+    const earbudsDelta = this.earbudsPhysPos.clone().sub(p.earbuds.userData.basePos);
+    const jackDelta = this.jackPhysPos.clone().sub(p.audioJack.userData.basePos);
+    const settled = earbudsDelta.lengthSq() === 0 && jackDelta.lengthSq() === 0 &&
+      this.cableGrabOffset.lengthSq() === 0 && this.wireImpulse === 0 && !this.isDraggingPart;
+    if (settled && this.wireAtRest) return;
+    this.wireAtRest = settled;
+
+    if (!p.wire || !p.wire.geometry || !p.wire.geometry.userData.origPositions || !this.cableEarbudsWeights) return;
+
+    const posAttr = p.wire.geometry.attributes.position;
+    const arr = posAttr.array;
+    const orig = p.wire.geometry.userData.origPositions;
+    const we = this.cableEarbudsWeights;
+    const wj = this.cableJackWeights;
+    const g = this.cableGrabOffset;
+    const gc = this.cableGrabCenter;
+    const grabSigma2 = 2 * 0.04 * 0.04;
+    const hasGrab = g.lengthSq() > 0;
+    const rippleAmp = Math.min(this.wireImpulse, 4.0) * 0.00025;
+
+    for (let i = 0; i < posAttr.count; i++) {
+      const idx = i * 3;
+      const ox = orig[idx];
+      const oy = orig[idx + 1];
+      const oz = orig[idx + 2];
+
+      let dx = we[i] * earbudsDelta.x + wj[i] * jackDelta.x;
+      let dy = we[i] * earbudsDelta.y + wj[i] * jackDelta.y;
+      let dz = we[i] * earbudsDelta.z + wj[i] * jackDelta.z;
+
+      if (hasGrab) {
+        const d2 = (ox - gc.x) ** 2 + (oy - gc.y) ** 2 + (oz - gc.z) ** 2;
+        const wg = Math.exp(-d2 / grabSigma2);
+        dx += wg * g.x;
+        dy += wg * g.y;
+        dz += wg * g.z;
+      }
+
+      // Interaction ripple, decaying with the impulse and pinned to zero at the joints
+      if (rippleAmp > 0) {
+        const free = 1 - Math.max(we[i], wj[i]);
+        dy += Math.sin(ox * 28.0 + oz * 16.0 + time * 3.4) * rippleAmp * free;
+        dx += Math.cos(oz * 22.0 + time * 2.8) * rippleAmp * free;
+      }
+
+      arr[idx]     = ox + dx;
+      arr[idx + 1] = oy + dy;
+      arr[idx + 2] = oz + dz;
+    }
+
+    posAttr.needsUpdate = true;
   }
 
   /* ==========================================================================
@@ -821,21 +786,25 @@ class Soundcore3DViewer {
     const pal = FINISH_COLORS[colorKey] || FINISH_COLORS.orange;
     const parts = this.extractParts(rootNode);
 
-    // 1. Chassis: CNC Aerospace Anodized Aluminum in selected finish
-    if (parts.chassis) {
-      parts.chassis.material = new THREE.MeshStandardMaterial({
-        color: pal.hex,
-        roughness: 0.22,
-        metalness: 0.88,
-        envMapIntensity: 1.6,
-        side: THREE.DoubleSide
-      });
-    }
+    // 1. Chassis: CNC Aerospace Anodized Aluminum in selected finish, with a lacquer clearcoat for crisp highlights.
+    //    The GLB's "jack_rings" primitive actually covers roughly half of the unibody shell
+    //    (8k verts spanning the full chassis bounds), so it shares the body material.
+    const bodyMaterial = new THREE.MeshPhysicalMaterial({
+      color: srgb(pal.hex),
+      roughness: 0.35,
+      metalness: 0.55,
+      clearcoat: 0.6,
+      clearcoatRoughness: 0.12,
+      envMapIntensity: 0.9,
+      side: THREE.DoubleSide
+    });
+    if (parts.chassis) parts.chassis.material = bodyMaterial;
+    if (parts.jackRings) parts.jackRings.material = bodyMaterial;
 
     // 2. Click Wheel: Pure Apple Matte White Polycarbonate
     if (parts.clickWheel) {
       parts.clickWheel.material = new THREE.MeshStandardMaterial({
-        color: 0xf4f4f6,
+        color: srgb(0xf4f4f6),
         roughness: 0.38,
         metalness: 0.10,
         envMapIntensity: 0.85,
@@ -857,7 +826,7 @@ class Soundcore3DViewer {
     // 4. Retina Display Glass: Deep glossy OLED display glass reflecting studio softbox
     if (parts.screenGlass) {
       parts.screenGlass.material = new THREE.MeshStandardMaterial({
-        color: 0x06080c,
+        color: srgb(0x06080c),
         roughness: 0.04,
         metalness: 0.18,
         transparent: true,
@@ -867,32 +836,23 @@ class Soundcore3DViewer {
       });
     }
 
-    // 5. 3.5mm Headphone Jack Ports: 24K Gold-plated mirror finish
-    if (parts.jackRings) {
-      parts.jackRings.material = new THREE.MeshStandardMaterial({
-        color: 0xd4af37,
-        roughness: 0.12,
-        metalness: 0.98,
-        envMapIntensity: 2.5,
-        side: THREE.DoubleSide
-      });
-    }
-
-    // 6. Earbuds: Precision dynamic acoustic drivers in matching finish
+    // 5. Earbuds: Precision dynamic acoustic drivers in matching finish
     if (parts.earbuds) {
-      parts.earbuds.material = new THREE.MeshStandardMaterial({
-        color: pal.hex,
-        roughness: 0.26,
-        metalness: 0.78,
-        envMapIntensity: 1.5,
+      parts.earbuds.material = new THREE.MeshPhysicalMaterial({
+        color: srgb(pal.hex),
+        roughness: 0.32,
+        metalness: 0.5,
+        clearcoat: 0.6,
+        clearcoatRoughness: 0.12,
+        envMapIntensity: 0.9,
         side: THREE.DoubleSide
       });
     }
 
-    // 7. Audio Jack: Precision machined metal collar in matching finish
+    // 6. Audio Jack: Precision machined metal collar in matching finish
     if (parts.audioJack) {
       parts.audioJack.material = new THREE.MeshStandardMaterial({
-        color: pal.hex,
+        color: srgb(pal.hex),
         roughness: 0.16,
         metalness: 0.92,
         envMapIntensity: 2.0,
@@ -900,10 +860,10 @@ class Soundcore3DViewer {
       });
     }
 
-    // 8. Audio Cable: Clean Apple silicone white with soft matte drape (Zero rainbow, zero magenta)
+    // 7. Audio Cable: Clean Apple silicone white with soft matte drape (Zero rainbow, zero magenta)
     if (parts.wire) {
       parts.wire.material = new THREE.MeshStandardMaterial({
-        color: 0xf2f2f5,
+        color: srgb(0xf2f2f5),
         roughness: 0.88,
         metalness: 0.02,
         envMapIntensity: 0.35,
@@ -994,6 +954,13 @@ class Soundcore3DViewer {
 
     const studioPivot = new THREE.Group();
     const studioInner = this.loadedGlb.clone();
+    // Object3D.clone() shares geometry, and the GLB's earbuds/audio_jack/wire share one vertex
+    // buffer. Give the Studio its own copies so wire deformation (here or in the hero) can't
+    // leak into the earbuds and jack.
+    ['wire', 'earbuds', 'audio_jack'].forEach(name => {
+      const mesh = studioInner.getObjectByName(name);
+      if (mesh) mesh.geometry = mesh.geometry.clone();
+    });
 
     this.studioParts = this.setupMeshMaterials(studioInner, this.activeColor || 'orange');
 
@@ -1020,20 +987,14 @@ class Soundcore3DViewer {
     this.activeColor = colorKey;
     const pal = FINISH_COLORS[colorKey] || FINISH_COLORS.orange;
 
+    const color = srgb(pal.hex);
+
     [this.heroParts, this.studioParts].forEach(parts => {
       if (!parts) return;
-      if (parts.chassis && parts.chassis.material) {
-        parts.chassis.material.color.setHex(pal.hex);
-        parts.chassis.material.needsUpdate = true;
-      }
-      if (parts.earbuds && parts.earbuds.material) {
-        parts.earbuds.material.color.setHex(pal.hex);
-        parts.earbuds.material.needsUpdate = true;
-      }
-      if (parts.audioJack && parts.audioJack.material) {
-        parts.audioJack.material.color.setHex(pal.hex);
-        parts.audioJack.material.needsUpdate = true;
-      }
+      // chassis & jackRings share one body material
+      [parts.chassis, parts.earbuds, parts.audioJack].forEach(part => {
+        if (part && part.material) part.material.color.copy(color);
+      });
     });
   }
 
@@ -1077,6 +1038,7 @@ class Soundcore3DViewer {
       btnAssembled.addEventListener('click', () => {
         this.setModeButtons(btnAssembled);
         this.targetExplodeFactor = 0;
+        this.targetCameraDistance = this.defaultStudioDistance;
         this.setViewMode('all');
         if (legend) legend.classList.remove('active');
       });
@@ -1089,6 +1051,7 @@ class Soundcore3DViewer {
         this.setViewMode('all');
         if (legend) legend.classList.add('active');
         this.wireImpulse = 2.5;
+        this.targetCameraDistance = this.getStudioFitDistance();
       });
     }
 
@@ -1113,7 +1076,7 @@ class Soundcore3DViewer {
 
     if (btnReset && this.studioCamera) {
       btnReset.addEventListener('click', () => {
-        this.studioCamera.position.set(0, 0.35, 7.8);
+        this.targetCameraDistance = null;
         if (this.studioControls) this.studioControls.reset();
         this.targetExplodeFactor = 0;
         this.setViewMode('all');
@@ -1125,6 +1088,16 @@ class Soundcore3DViewer {
     window.addEventListener('resize', () => {
       this.handleResize();
     });
+  }
+
+  // Camera distance that fits the whole Studio model (cable, earbuds, player) in the viewport
+  getStudioFitDistance() {
+    if (!this.studioModelRoot) return this.defaultStudioDistance;
+    const size = new THREE.Box3().setFromObject(this.studioModelRoot).getSize(new THREE.Vector3());
+    const halfTan = Math.tan(THREE.MathUtils.degToRad(this.studioCamera.fov) / 2);
+    const halfHeight = Math.max(size.y, size.x / this.studioCamera.aspect) / 2;
+    const fit = halfHeight / halfTan * 0.95;
+    return THREE.MathUtils.clamp(fit, this.defaultStudioDistance, this.studioControls ? this.studioControls.maxDistance : fit);
   }
 
   setModeButtons(activeBtn) {
